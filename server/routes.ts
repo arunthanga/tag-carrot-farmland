@@ -1,377 +1,306 @@
 import express from 'express';
+import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import cors from 'cors';
 import { DatabaseStorage } from './database-storage';
-import { 
-  authenticate, 
-  requireAdmin, 
-  optionalAuthenticate,
-  generateToken,
-  rateLimitByUser
-} from './middleware/auth';
-import { 
-  errorHandler, 
-  notFoundHandler, 
-  asyncHandler, 
-  validateRequest,
-  NotFoundError,
-  ValidationError,
-  AuthenticationError
-} from './middleware/errorHandler';
-import {
-  createProjectSchema,
-  updateProjectSchema,
-  projectQuerySchema,
-  createLeadSchema,
-  updateLeadSchema,
-  leadQuerySchema,
-  createUserSchema,
-  loginSchema,
-  updateUserSchema,
-  blogQuerySchema,
-  idSchema
-} from '../shared/validation';
-import { rateLimitConfig } from './config/env';
-import { logInfo, logWarn } from './config/logger';
+import { logger } from './utils/logger';
+import { asyncHandler } from './utils/asyncHandler';
+import { validateRequest } from './middleware/validation';
+import { authenticateToken } from './middleware/auth';
 
 const router = express.Router();
-export const storage = new DatabaseStorage();
+const storage = new DatabaseStorage();
+
+// Security middleware
+router.use(helmet());
+router.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 
 // Rate limiting
-const generalLimiter = rateLimit({
-  ...rateLimitConfig,
-  message: { error: 'Too many requests, please try again later.' }
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 const strictLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 requests per window
-  message: { error: 'Too many requests for this action, please try again later.' }
+  windowMs: 15 * 60 * 1000,
+  max: 10, // More restrictive for sensitive endpoints
+  message: 'Rate limit exceeded for this endpoint',
 });
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 login attempts per window
-  message: { error: 'Too many login attempts, please try again later.' }
+router.use('/api', limiter);
+
+// Validation schemas
+const leadSchema = z.object({
+  name: z.string().min(2, 'Name must be at least 2 characters').max(100),
+  email: z.string().email('Invalid email format'),
+  phone: z.string().regex(/^\+?[\d\s\-\(\)]+$/, 'Invalid phone number format'),
+  location: z.string().min(2).max(100),
+  projectInterest: z.string().optional(),
+  message: z.string().max(1000, 'Message too long').optional(),
+  source: z.enum(['website', 'social', 'referral', 'other']).default('website'),
+  utmSource: z.string().optional(),
+  utmMedium: z.string().optional(),
+  utmCampaign: z.string().optional()
 });
 
-// Apply general rate limiting to all routes
-router.use(generalLimiter);
+const userSchema = z.object({
+  name: z.string().min(2).max(100),
+  email: z.string().email(),
+  phone: z.string().regex(/^\+?[\d\s\-\(\)]+$/),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  location: z.string().min(2).max(100)
+});
 
-// HEALTH CHECK
-router.get('/health', asyncHandler(async (req, res) => {
-  const health = await storage.healthCheck();
-  res.json(health);
-}));
+const projectQuerySchema = z.object({
+  location: z.string().optional(),
+  type: z.enum(['coconut', 'spice', 'backwater']).optional(),
+  minPrice: z.string().transform(Number).optional(),
+  maxPrice: z.string().transform(Number).optional(),
+  page: z.string().transform(Number).default('1'),
+  limit: z.string().transform(Number).default('10')
+});
 
-// PUBLIC ROUTES
-
-// Get all projects (public)
-router.get('/projects', 
+// Projects endpoints
+router.get('/api/projects', 
   validateRequest({ query: projectQuerySchema }),
   asyncHandler(async (req, res) => {
-    const projects = await storage.getProjects(req.query);
+    const { location, type, minPrice, maxPrice, page, limit } = req.query;
+    
+    const filters = {
+      location,
+      type,
+      priceRange: minPrice || maxPrice ? { min: minPrice, max: maxPrice } : undefined
+    };
+    
+    const result = await storage.getProjects(filters, { page, limit });
+    
     res.json({
-      data: projects,
-      meta: {
-        count: projects.length,
-        query: req.query
+      success: true,
+      data: result.projects,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(result.total / limit),
+        totalItems: result.total,
+        itemsPerPage: limit
       }
     });
   })
 );
 
-// Get featured projects (public)
-router.get('/projects/featured', 
+router.get('/api/projects/featured', 
   asyncHandler(async (req, res) => {
-    const projects = await storage.getProjects({ featured: true, limit: 6 });
+    const projects = await storage.getFeaturedProjects();
     res.json({
-      data: projects,
-      meta: {
-        count: projects.length
-      }
+      success: true,
+      data: projects
     });
   })
 );
 
-// Get project by slug (public)
-router.get('/projects/:slug', 
+router.get('/api/projects/:slug', 
   asyncHandler(async (req, res) => {
     const { slug } = req.params;
     const project = await storage.getProjectBySlug(slug);
     
     if (!project) {
-      throw new NotFoundError('Project not found');
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
     }
     
-    res.json({ data: project });
+    // Track project views for analytics
+    await storage.incrementProjectViews(project.id);
+    
+    res.json({
+      success: true,
+      data: project
+    });
   })
 );
 
-// Create lead (public, with strict rate limiting)
-router.post('/leads',
+// Lead management endpoints
+router.post('/api/leads', 
   strictLimiter,
-  validateRequest({ body: createLeadSchema }),
+  validateRequest({ body: leadSchema }),
   asyncHandler(async (req, res) => {
-    const lead = await storage.createLead(req.body);
+    const leadData = req.body;
     
-    logInfo('New lead created', { 
-      leadId: lead.id, 
-      email: lead.email,
-      source: lead.source,
-      ip: req.ip 
+    // Check for duplicate leads (same email within 24 hours)
+    const existingLead = await storage.getRecentLeadByEmail(leadData.email);
+    if (existingLead) {
+      return res.status(409).json({
+        success: false,
+        error: 'A lead with this email was already submitted recently'
+      });
+    }
+    
+    const lead = await storage.createLead({
+      ...leadData,
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent'),
+      createdAt: new Date()
     });
     
+    // Send notification email (implement this based on your email service)
+    // await emailService.sendLeadNotification(lead);
+    
+    logger.info('New lead created', { leadId: lead.id, email: lead.email });
+    
     res.status(201).json({
-      data: lead,
+      success: true,
+      data: { id: lead.id },
       message: 'Thank you for your interest! We will contact you soon.'
     });
   })
 );
 
-// Get blog posts (public)
-router.get('/blog',
-  validateRequest({ query: blogQuerySchema }),
+router.get('/api/leads', 
+  authenticateToken,
   asyncHandler(async (req, res) => {
-    const posts = await storage.getBlogPosts({ ...req.query, published: true });
+    const { page = 1, limit = 20, status, source } = req.query;
+    
+    const filters = { status, source };
+    const leads = await storage.getLeads(filters, { page: Number(page), limit: Number(limit) });
+    
     res.json({
-      data: posts,
-      meta: {
-        count: posts.length
-      }
+      success: true,
+      data: leads
     });
   })
 );
 
-// Get testimonials (public)
-router.get('/testimonials',
-  asyncHandler(async (req, res) => {
-    const featured = req.query.featured === 'true';
-    const testimonials = await storage.getTestimonials(featured);
-    res.json({
-      data: testimonials,
-      meta: {
-        count: testimonials.length
-      }
-    });
-  })
-);
-
-// AUTHENTICATION ROUTES
-
-// User registration
-router.post('/auth/register',
+// User management endpoints
+router.post('/api/users', 
   strictLimiter,
-  validateRequest({ body: createUserSchema }),
+  validateRequest({ body: userSchema }),
   asyncHandler(async (req, res) => {
-    const user = await storage.createUser(req.body);
-    const token = generateToken({
-      id: user.id,
-      email: user.email,
-      role: user.role
-    });
+    const userData = req.body;
     
-    logInfo('User registered', { userId: user.id, email: user.email });
-    
-    res.status(201).json({
-      data: { user, token },
-      message: 'Account created successfully'
-    });
-  })
-);
-
-// User login
-router.post('/auth/login',
-  authLimiter,
-  validateRequest({ body: loginSchema }),
-  asyncHandler(async (req, res) => {
-    const { email, password } = req.body;
-    const user = await storage.authenticateUser(email, password);
-    
-    if (!user) {
-      logWarn('Failed login attempt', { email, ip: req.ip });
-      throw new AuthenticationError('Invalid email or password');
+    // Check if user already exists
+    const existingUser = await storage.getUserByEmail(userData.email);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        error: 'User with this email already exists'
+      });
     }
     
-    const token = generateToken({
-      id: user.id,
-      email: user.email,
-      role: user.role
-    });
+    const user = await storage.createUser(userData);
     
-    logInfo('User logged in', { userId: user.id, email: user.email });
-    
-    res.json({
-      data: { user, token },
-      message: 'Login successful'
-    });
-  })
-);
-
-// Get current user profile
-router.get('/auth/me',
-  authenticate,
-  asyncHandler(async (req, res) => {
-    const user = await storage.getUserByEmail(req.user!.email);
-    if (!user) {
-      throw new NotFoundError('User not found');
-    }
-    
-    const { password, ...userWithoutPassword } = user;
-    res.json({ data: userWithoutPassword });
-  })
-);
-
-// Update user profile
-router.put('/auth/me',
-  authenticate,
-  rateLimitByUser(10, 15 * 60 * 1000), // 10 requests per 15 minutes per user
-  validateRequest({ body: updateUserSchema }),
-  asyncHandler(async (req, res) => {
-    // Implementation would go here - updating user profile
-    res.json({ message: 'Profile update endpoint - to be implemented' });
-  })
-);
-
-// PROTECTED ROUTES (Admin only)
-
-// Get all leads (admin only)
-router.get('/admin/leads',
-  authenticate,
-  requireAdmin,
-  validateRequest({ query: leadQuerySchema }),
-  asyncHandler(async (req, res) => {
-    const leads = await storage.getLeads(req.query);
-    res.json({
-      data: leads,
-      meta: {
-        count: leads.length,
-        query: req.query
-      }
-    });
-  })
-);
-
-// Update lead status (admin only)
-router.put('/admin/leads/:id',
-  authenticate,
-  requireAdmin,
-  validateRequest({ 
-    params: idSchema.transform(id => ({ id })),
-    body: updateLeadSchema 
-  }),
-  asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const lead = await storage.updateLead(id, req.body);
-    
-    logInfo('Lead updated by admin', { 
-      leadId: id, 
-      adminId: req.user!.id,
-      updates: req.body 
-    });
-    
-    res.json({
-      data: lead,
-      message: 'Lead updated successfully'
-    });
-  })
-);
-
-// Create project (admin only)
-router.post('/admin/projects',
-  authenticate,
-  requireAdmin,
-  validateRequest({ body: createProjectSchema }),
-  asyncHandler(async (req, res) => {
-    const project = await storage.createProject(req.body);
-    
-    logInfo('Project created by admin', { 
-      projectId: project.id, 
-      adminId: req.user!.id 
-    });
+    // Remove password from response
+    const { password, ...userResponse } = user;
     
     res.status(201).json({
-      data: project,
-      message: 'Project created successfully'
+      success: true,
+      data: userResponse
     });
   })
 );
 
-// Update project (admin only)
-router.put('/admin/projects/:id',
-  authenticate,
-  requireAdmin,
-  validateRequest({ 
-    params: idSchema.transform(id => ({ id })),
-    body: updateProjectSchema 
-  }),
+// Blog endpoints
+router.get('/api/blog', 
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const project = await storage.updateProject(id, req.body);
+    const { page = 1, limit = 10, category, featured } = req.query;
     
-    logInfo('Project updated by admin', { 
-      projectId: id, 
-      adminId: req.user!.id,
-      updates: req.body 
-    });
+    const filters = { category, featured: featured === 'true' };
+    const posts = await storage.getBlogPosts(filters, { page: Number(page), limit: Number(limit) });
     
     res.json({
-      data: project,
-      message: 'Project updated successfully'
+      success: true,
+      data: posts
     });
   })
 );
 
-// Delete project (admin only)
-router.delete('/admin/projects/:id',
-  authenticate,
-  requireAdmin,
-  validateRequest({ params: idSchema.transform(id => ({ id })) }),
+router.get('/api/blog/:slug', 
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    await storage.deleteProject(id);
+    const { slug } = req.params;
+    const post = await storage.getBlogPostBySlug(slug);
     
-    logInfo('Project deleted by admin', { 
-      projectId: id, 
-      adminId: req.user!.id 
-    });
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        error: 'Blog post not found'
+      });
+    }
     
-    res.json({ message: 'Project deleted successfully' });
-  })
-);
-
-// Get all blog posts (admin only)
-router.get('/admin/blog',
-  authenticate,
-  requireAdmin,
-  validateRequest({ query: blogQuerySchema }),
-  asyncHandler(async (req, res) => {
-    const posts = await storage.getBlogPosts(req.query);
     res.json({
-      data: posts,
-      meta: {
-        count: posts.length
-      }
+      success: true,
+      data: post
     });
   })
 );
 
-// Analytics endpoint (admin only)
-router.get('/admin/analytics',
-  authenticate,
-  requireAdmin,
+// Testimonials endpoint
+router.get('/api/testimonials', 
   asyncHandler(async (req, res) => {
-    // Get basic analytics
-    const [allLeads, newLeads, allProjects] = await Promise.all([
-      storage.getLeads(),
-      storage.getLeads({ status: 'new' }),
-      storage.getProjects()
-    ]);
+    const { featured } = req.query;
+    const testimonials = await storage.getTestimonials({ featured: featured === 'true' });
+    
+    res.json({
+      success: true,
+      data: testimonials
+    });
+  })
+);
 
-    const analytics = {
-      leads: {
-        total: allLeads.length,
-        new: newLeads.length,
-        byStatus: allLeads.reduce((acc, lead) => {
-          acc[lead.status] = (acc[lead.status] || 0) + 1;
-          return acc;
-        }, {} as Record
+// Analytics endpoint
+router.get('/api/analytics/dashboard', 
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const { dateRange = '30d' } = req.query;
+    
+    const analytics = await storage.getAnalyticsDashboard(dateRange);
+    
+    res.json({
+      success: true,
+      data: analytics
+    });
+  })
+);
+
+// Health check endpoint
+router.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    version: process.env.APP_VERSION || '1.0.0'
+  });
+});
+
+// Global error handler
+router.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  logger.error('API Error', { error: err.message, stack: err.stack, path: req.path });
+  
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      success: false,
+      error: 'Validation failed',
+      details: err.details
+    });
+  }
+  
+  if (err.name === 'UnauthorizedError') {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized access'
+    });
+  }
+  
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error',
+    ...(process.env.NODE_ENV === 'development' && { details: err.message })
+  });
+});
+
+export default router;

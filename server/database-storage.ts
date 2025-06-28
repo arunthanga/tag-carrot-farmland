@@ -1,508 +1,531 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { eq, and, desc, asc, like, gte, lte, inArray } from 'drizzle-orm';
-import NodeCache from 'node-cache';
-import { 
-  projects, 
-  leads, 
-  users, 
-  blogPosts, 
-  testimonials,
-  type Project,
-  type Lead,
-  type User,
-  type BlogPost,
-  type Testimonial
-} from '../shared/schema';
-import { 
-  CreateProject,
-  UpdateProject,
-  ProjectQuery,
-  CreateLead,
-  UpdateLead,
-  LeadQuery,
-  CreateUser,
-  UpdateUser,
-  CreateBlog,
-  UpdateBlog,
-  BlogQuery,
-  CreateTestimonial,
-  UpdateTestimonial
-} from '../shared/validation';
-import { dbConfig, cacheConfig } from './config/env';
-import { logInfo, logError, logWarn } from './config/logger';
-import { hashPassword, comparePassword } from './middleware/auth';
-import { NotFoundError, ConflictError } from './middleware/errorHandler';
+import { eq, and, gte, lte, desc, asc, sql, ilike, or } from 'drizzle-orm';
+import { projects, leads, users, blogPosts, testimonials, projectViews, analytics } from '../shared/schema';
+import { Redis } from 'ioredis';
+import { logger } from './utils/logger';
 
-// Database connection
-const connectionString = dbConfig.url;
-const client = postgres(connectionString, {
-  ssl: dbConfig.ssl,
-  max: 20,
-  idle_timeout: 20,
-  connect_timeout: 10,
-});
+interface DatabaseConfig {
+  connectionString: string;
+  maxConnections?: number;
+  idleTimeout?: number;
+  ssl?: boolean;
+}
 
-export const db = drizzle(client);
-
-// Cache instance
-const cache = new NodeCache(cacheConfig);
+interface CacheConfig {
+  redis?: {
+    host: string;
+    port: number;
+    password?: string;
+  };
+  ttl?: number;
+}
 
 export class DatabaseStorage {
-  // Helper method to generate cache key
-  private getCacheKey(prefix: string, params?: any): string {
-    const key = params ? `${prefix}:${JSON.stringify(params)}` : prefix;
-    return key;
-  }
+  private db: ReturnType<typeof drizzle>;
+  private cache?: Redis;
+  private readonly cacheTTL: number;
 
-  // Helper method to invalidate related cache entries
-  private invalidateCache(patterns: string[]): void {
-    const keys = cache.keys();
-    patterns.forEach(pattern => {
-      const toDelete = keys.filter(key => key.includes(pattern));
-      cache.del(toDelete);
+  constructor(config?: { database?: DatabaseConfig; cache?: CacheConfig }) {
+    const connectionString = config?.database?.connectionString || process.env.DATABASE_URL!;
+    
+    const client = postgres(connectionString, {
+      max: config?.database?.maxConnections || 20,
+      idle_timeout: config?.database?.idleTimeout || 20,
+      ssl: config?.database?.ssl || process.env.NODE_ENV === 'production'
     });
+
+    this.db = drizzle(client);
+    this.cacheTTL = config?.cache?.ttl || 300; // 5 minutes default
+
+    // Initialize Redis cache if configured
+    if (config?.cache?.redis) {
+      this.cache = new Redis(config.cache.redis);
+      this.cache.on('error', (err) => {
+        logger.error('Redis connection error', err);
+      });
+    }
+
+    this.initializeDatabase();
   }
 
-  // PROJECT METHODS
-  async getProjects(query?: ProjectQuery): Promise<Project[]> {
-    const cacheKey = this.getCacheKey('projects', query);
-    const cached = cache.get<Project[]>(cacheKey);
+  private async initializeDatabase() {
+    try {
+      // Create indexes for better performance
+      await this.createIndexes();
+      logger.info('Database initialized successfully');
+    } catch (error) {
+      logger.error('Database initialization failed', error);
+      throw error;
+    }
+  }
+
+  private async createIndexes() {
+    // Create indexes for commonly queried fields
+    const indexes = [
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_projects_location ON projects(location)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_projects_type ON projects(project_type)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_projects_featured ON projects(featured)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_projects_price ON projects(price_per_sq_ft)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_email ON leads(email)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_created_at ON leads(created_at)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_status ON leads(status)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email ON users(email)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_blog_posts_slug ON blog_posts(slug)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_blog_posts_published_at ON blog_posts(published_at)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_project_views_project_id ON project_views(project_id)',
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_project_views_created_at ON project_views(created_at)'
+    ];
+
+    for (const indexSQL of indexes) {
+      try {
+        await this.db.execute(sql.raw(indexSQL));
+      } catch (error) {
+        // Index might already exist, continue
+        logger.debug('Index creation skipped', { sql: indexSQL });
+      }
+    }
+  }
+
+  private getCacheKey(prefix: string, ...params: (string | number)[]): string {
+    return `tagcarrot:${prefix}:${params.join(':')}`;
+  }
+
+  private async getFromCache<T>(key: string): Promise<T | null> {
+    if (!this.cache) return null;
     
-    if (cached) {
-      logInfo('Projects cache hit', { query });
-      return cached;
-    }
-
     try {
-      let dbQuery = db.select().from(projects).where(eq(projects.active, true));
-
-      // Apply filters
-      if (query?.type) {
-        dbQuery = dbQuery.where(eq(projects.projectType, query.type));
-      }
-      if (query?.featured !== undefined) {
-        dbQuery = dbQuery.where(eq(projects.featured, query.featured));
-      }
-
-      // Apply sorting
-      dbQuery = dbQuery.orderBy(desc(projects.featured), asc(projects.name));
-
-      // Apply pagination
-      if (query?.limit) {
-        dbQuery = dbQuery.limit(query.limit);
-      }
-      if (query?.offset) {
-        dbQuery = dbQuery.offset(query.offset);
-      }
-
-      const result = await dbQuery;
-      cache.set(cacheKey, result);
-      
-      logInfo('Projects fetched from database', { count: result.length, query });
-      return result;
+      const cached = await this.cache.get(key);
+      return cached ? JSON.parse(cached) : null;
     } catch (error) {
-      logError('Failed to fetch projects', error as Error, { query });
-      throw error;
+      logger.warn('Cache get error', { key, error });
+      return null;
     }
   }
 
-  async getProjectBySlug(slug: string): Promise<Project | null> {
-    const cacheKey = this.getCacheKey('project', { slug });
-    const cached = cache.get<Project>(cacheKey);
+  private async setCache(key: string, value: any, ttl?: number): Promise<void> {
+    if (!this.cache) return;
     
-    if (cached) {
-      return cached;
-    }
-
     try {
-      const result = await db
-        .select()
-        .from(projects)
-        .where(and(eq(projects.slug, slug), eq(projects.active, true)))
-        .limit(1);
-
-      const project = result[0] || null;
-      if (project) {
-        cache.set(cacheKey, project);
-      }
-
-      return project;
+      await this.cache.setex(key, ttl || this.cacheTTL, JSON.stringify(value));
     } catch (error) {
-      logError('Failed to fetch project by slug', error as Error, { slug });
-      throw error;
+      logger.warn('Cache set error', { key, error });
     }
   }
 
-  async createProject(projectData: CreateProject): Promise<Project> {
-    try {
-      // Check if slug already exists
-      const existing = await this.getProjectBySlug(projectData.slug);
-      if (existing) {
-        throw new ConflictError('Project with this slug already exists');
-      }
-
-      const result = await db
-        .insert(projects)
-        .values({
-          ...projectData,
-          id: crypto.randomUUID(),
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning();
-
-      const project = result[0];
-      
-      // Invalidate cache
-      this.invalidateCache(['projects']);
-      
-      logInfo('Project created', { projectId: project.id, name: project.name });
-      return project;
-    } catch (error) {
-      logError('Failed to create project', error as Error, { projectData });
-      throw error;
-    }
-  }
-
-  async updateProject(id: string, updates: UpdateProject): Promise<Project> {
-    try {
-      const result = await db
-        .update(projects)
-        .set({
-          ...updates,
-          updatedAt: new Date(),
-        })
-        .where(eq(projects.id, id))
-        .returning();
-
-      if (result.length === 0) {
-        throw new NotFoundError('Project not found');
-      }
-
-      const project = result[0];
-      
-      // Invalidate cache
-      this.invalidateCache(['projects', 'project']);
-      
-      logInfo('Project updated', { projectId: id, updates });
-      return project;
-    } catch (error) {
-      logError('Failed to update project', error as Error, { id, updates });
-      throw error;
-    }
-  }
-
-  async deleteProject(id: string): Promise<void> {
-    try {
-      // Soft delete
-      const result = await db
-        .update(projects)
-        .set({ active: false, updatedAt: new Date() })
-        .where(eq(projects.id, id))
-        .returning();
-
-      if (result.length === 0) {
-        throw new NotFoundError('Project not found');
-      }
-
-      // Invalidate cache
-      this.invalidateCache(['projects', 'project']);
-      
-      logInfo('Project deleted', { projectId: id });
-    } catch (error) {
-      logError('Failed to delete project', error as Error, { id });
-      throw error;
-    }
-  }
-
-  // LEAD METHODS
-  async getLeads(query?: LeadQuery): Promise<Lead[]> {
-    const cacheKey = this.getCacheKey('leads', query);
-    const cached = cache.get<Lead[]>(cacheKey);
+  private async invalidateCache(pattern: string): Promise<void> {
+    if (!this.cache) return;
     
-    if (cached) {
-      return cached;
+    try {
+      const keys = await this.cache.keys(pattern);
+      if (keys.length > 0) {
+        await this.cache.del(...keys);
+      }
+    } catch (error) {
+      logger.warn('Cache invalidation error', { pattern, error });
     }
+  }
+
+  // Projects methods
+  async getProjects(filters: any = {}, pagination: { page: number; limit: number } = { page: 1, limit: 10 }) {
+    const cacheKey = this.getCacheKey('projects', JSON.stringify(filters), pagination.page, pagination.limit);
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
 
     try {
-      let dbQuery = db.select().from(leads);
+      let query = this.db.select().from(projects);
+      let countQuery = this.db.select({ count: sql<number>`count(*)` }).from(projects);
 
       // Apply filters
       const conditions = [];
-      if (query?.status) {
-        conditions.push(eq(leads.status, query.status));
+      if (filters.location) {
+        conditions.push(ilike(projects.location, `%${filters.location}%`));
       }
-      if (query?.source) {
-        conditions.push(eq(leads.source, query.source));
+      if (filters.type) {
+        conditions.push(eq(projects.projectType, filters.type));
       }
-      if (query?.dateFrom) {
-        conditions.push(gte(leads.createdAt, new Date(query.dateFrom)));
-      }
-      if (query?.dateTo) {
-        conditions.push(lte(leads.createdAt, new Date(query.dateTo)));
+      if (filters.priceRange) {
+        if (filters.priceRange.min) {
+          conditions.push(gte(projects.pricePerSqFt, filters.priceRange.min));
+        }
+        if (filters.priceRange.max) {
+          conditions.push(lte(projects.pricePerSqFt, filters.priceRange.max));
+        }
       }
 
       if (conditions.length > 0) {
-        dbQuery = dbQuery.where(and(...conditions));
+        const whereClause = conditions.length === 1 ? conditions[0] : and(...conditions);
+        query = query.where(whereClause);
+        countQuery = countQuery.where(whereClause);
       }
-
-      // Apply sorting
-      dbQuery = dbQuery.orderBy(desc(leads.createdAt));
 
       // Apply pagination
-      if (query?.limit) {
-        dbQuery = dbQuery.limit(query.limit);
-      }
-      if (query?.offset) {
-        dbQuery = dbQuery.offset(query.offset);
-      }
+      const offset = (pagination.page - 1) * pagination.limit;
+      query = query.limit(pagination.limit).offset(offset).orderBy(desc(projects.createdAt));
 
-      const result = await dbQuery;
-      cache.set(cacheKey, result);
-      
-      logInfo('Leads fetched from database', { count: result.length, query });
+      const [projectsResult, countResult] = await Promise.all([
+        query,
+        countQuery
+      ]);
+
+      const result = {
+        projects: projectsResult,
+        total: countResult[0].count
+      };
+
+      await this.setCache(cacheKey, result);
       return result;
     } catch (error) {
-      logError('Failed to fetch leads', error as Error, { query });
+      logger.error('Error fetching projects', error);
       throw error;
     }
   }
 
-  async createLead(leadData: CreateLead): Promise<Lead> {
-    try {
-      const result = await db
-        .insert(leads)
-        .values({
-          ...leadData,
-          id: crypto.randomUUID(),
-          status: 'new',
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning();
+  async getFeaturedProjects() {
+    const cacheKey = this.getCacheKey('projects', 'featured');
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
 
-      const lead = result[0];
-      
-      // Invalidate cache
-      this.invalidateCache(['leads']);
-      
-      logInfo('Lead created', { leadId: lead.id, email: lead.email });
-      return lead;
+    try {
+      const featuredProjects = await this.db
+        .select()
+        .from(projects)
+        .where(eq(projects.featured, true))
+        .orderBy(desc(projects.createdAt))
+        .limit(6);
+
+      await this.setCache(cacheKey, featuredProjects);
+      return featuredProjects;
     } catch (error) {
-      logError('Failed to create lead', error as Error, { leadData });
+      logger.error('Error fetching featured projects', error);
       throw error;
     }
   }
 
-  async updateLead(id: string, updates: UpdateLead): Promise<Lead> {
-    try {
-      const result = await db
-        .update(leads)
-        .set({
-          ...updates,
-          updatedAt: new Date(),
-        })
-        .where(eq(leads.id, id))
-        .returning();
+  async getProjectBySlug(slug: string) {
+    const cacheKey = this.getCacheKey('project', 'slug', slug);
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
 
-      if (result.length === 0) {
-        throw new NotFoundError('Lead not found');
+    try {
+      const project = await this.db
+        .select()
+        .from(projects)
+        .where(eq(projects.slug, slug))
+        .limit(1);
+
+      const result = project[0] || null;
+      await this.setCache(cacheKey, result);
+      return result;
+    } catch (error) {
+      logger.error('Error fetching project by slug', error);
+      throw error;
+    }
+  }
+
+  async incrementProjectViews(projectId: string) {
+    try {
+      await this.db.insert(projectViews).values({
+        id: crypto.randomUUID(),
+        projectId,
+        viewedAt: new Date(),
+        ipAddress: '', // Will be set by the calling function
+        userAgent: ''
+      });
+
+      // Invalidate project cache
+      await this.invalidateCache(`tagcarrot:project:*`);
+    } catch (error) {
+      logger.error('Error incrementing project views', error);
+    }
+  }
+
+  // Leads methods
+  async createLead(leadData: any) {
+    try {
+      const lead = await this.db.insert(leads).values({
+        id: crypto.randomUUID(),
+        ...leadData,
+        status: 'new',
+        createdAt: new Date()
+      }).returning();
+
+      // Invalidate leads cache
+      await this.invalidateCache('tagcarrot:leads:*');
+
+      // Update analytics
+      await this.updateAnalytics('lead_created');
+
+      return lead[0];
+    } catch (error) {
+      logger.error('Error creating lead', error);
+      throw error;
+    }
+  }
+
+  async getRecentLeadByEmail(email: string, hours: number = 24) {
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
+    
+    try {
+      const recentLead = await this.db
+        .select()
+        .from(leads)
+        .where(and(
+          eq(leads.email, email),
+          gte(leads.createdAt, cutoff)
+        ))
+        .limit(1);
+
+      return recentLead[0] || null;
+    } catch (error) {
+      logger.error('Error checking recent lead', error);
+      throw error;
+    }
+  }
+
+  async getLeads(filters: any = {}, pagination: { page: number; limit: number } = { page: 1, limit: 20 }) {
+    try {
+      let query = this.db.select().from(leads);
+
+      const conditions = [];
+      if (filters.status) {
+        conditions.push(eq(leads.status, filters.status));
+      }
+      if (filters.source) {
+        conditions.push(eq(leads.source, filters.source));
       }
 
-      const lead = result[0];
-      
-      // Invalidate cache
-      this.invalidateCache(['leads']);
-      
-      logInfo('Lead updated', { leadId: id, updates });
-      return lead;
+      if (conditions.length > 0) {
+        query = query.where(and(...conditions));
+      }
+
+      const offset = (pagination.page - 1) * pagination.limit;
+      const result = await query
+        .limit(pagination.limit)
+        .offset(offset)
+        .orderBy(desc(leads.createdAt));
+
+      return result;
     } catch (error) {
-      logError('Failed to update lead', error as Error, { id, updates });
+      logger.error('Error fetching leads', error);
       throw error;
     }
   }
 
-  // USER METHODS
-  async getUserByEmail(email: string): Promise<User | null> {
-    const cacheKey = this.getCacheKey('user', { email });
-    const cached = cache.get<User>(cacheKey);
-    
-    if (cached) {
-      return cached;
-    }
-
+  // Users methods
+  async createUser(userData: any) {
     try {
-      const result = await db
+      const hashedPassword = await this.hashPassword(userData.password);
+      
+      const user = await this.db.insert(users).values({
+        id: crypto.randomUUID(),
+        ...userData,
+        password: hashedPassword,
+        createdAt: new Date()
+      }).returning();
+
+      await this.updateAnalytics('user_registered');
+
+      return user[0];
+    } catch (error) {
+      logger.error('Error creating user', error);
+      throw error;
+    }
+  }
+
+  async getUserByEmail(email: string) {
+    try {
+      const user = await this.db
         .select()
         .from(users)
         .where(eq(users.email, email))
         .limit(1);
 
-      const user = result[0] || null;
-      if (user) {
-        cache.set(cacheKey, user);
-      }
-
-      return user;
+      return user[0] || null;
     } catch (error) {
-      logError('Failed to fetch user by email', error as Error, { email });
+      logger.error('Error fetching user by email', error);
       throw error;
     }
   }
 
-  async createUser(userData: CreateUser): Promise<User> {
-    try {
-      // Check if user already exists
-      const existing = await this.getUserByEmail(userData.email);
-      if (existing) {
-        throw new ConflictError('User with this email already exists');
-      }
-
-      // Hash password
-      const hashedPassword = await hashPassword(userData.password);
-
-      const result = await db
-        .insert(users)
-        .values({
-          ...userData,
-          id: crypto.randomUUID(),
-          password: hashedPassword,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning();
-
-      const user = result[0];
-      
-      // Remove password from response
-      const { password, ...userWithoutPassword } = user;
-      
-      // Invalidate cache
-      this.invalidateCache(['user']);
-      
-      logInfo('User created', { userId: user.id, email: user.email });
-      return userWithoutPassword as User;
-    } catch (error) {
-      logError('Failed to create user', error as Error, { email: userData.email });
-      throw error;
-    }
-  }
-
-  async authenticateUser(email: string, password: string): Promise<User | null> {
-    try {
-      const user = await this.getUserByEmail(email);
-      if (!user) {
-        logWarn('Authentication attempt for non-existent user', { email });
-        return null;
-      }
-
-      const isValid = await comparePassword(password, user.password);
-      if (!isValid) {
-        logWarn('Invalid password attempt', { email, userId: user.id });
-        return null;
-      }
-
-      // Remove password from response
-      const { password: _, ...userWithoutPassword } = user;
-      
-      logInfo('User authenticated successfully', { userId: user.id, email });
-      return userWithoutPassword as User;
-    } catch (error) {
-      logError('Failed to authenticate user', error as Error, { email });
-      throw error;
-    }
-  }
-
-  // BLOG METHODS
-  async getBlogPosts(query?: BlogQuery): Promise<BlogPost[]> {
-    const cacheKey = this.getCacheKey('blog', query);
-    const cached = cache.get<BlogPost[]>(cacheKey);
-    
-    if (cached) {
-      return cached;
-    }
+  // Blog methods
+  async getBlogPosts(filters: any = {}, pagination: { page: number; limit: number } = { page: 1, limit: 10 }) {
+    const cacheKey = this.getCacheKey('blog', JSON.stringify(filters), pagination.page, pagination.limit);
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
 
     try {
-      let dbQuery = db.select().from(blogPosts);
+      let query = this.db.select().from(blogPosts);
 
-      // Apply filters
-      const conditions = [];
-      if (query?.published !== undefined) {
-        conditions.push(eq(blogPosts.published, query.published));
+      const conditions = [eq(blogPosts.published, true)];
+      if (filters.category) {
+        conditions.push(eq(blogPosts.category, filters.category));
       }
-      if (query?.tag) {
-        conditions.push(like(blogPosts.tags, `%${query.tag}%`));
-      }
-
-      if (conditions.length > 0) {
-        dbQuery = dbQuery.where(and(...conditions));
+      if (filters.featured) {
+        conditions.push(eq(blogPosts.featured, filters.featured));
       }
 
-      // Apply sorting
-      dbQuery = dbQuery.orderBy(desc(blogPosts.publishedAt), desc(blogPosts.createdAt));
+      query = query.where(and(...conditions));
 
-      // Apply pagination
-      if (query?.limit) {
-        dbQuery = dbQuery.limit(query.limit);
-      }
-      if (query?.offset) {
-        dbQuery = dbQuery.offset(query.offset);
-      }
+      const offset = (pagination.page - 1) * pagination.limit;
+      const result = await query
+        .limit(pagination.limit)
+        .offset(offset)
+        .orderBy(desc(blogPosts.publishedAt));
 
-      const result = await dbQuery;
-      cache.set(cacheKey, result);
-      
+      await this.setCache(cacheKey, result);
       return result;
     } catch (error) {
-      logError('Failed to fetch blog posts', error as Error, { query });
+      logger.error('Error fetching blog posts', error);
       throw error;
     }
   }
 
-  // TESTIMONIAL METHODS
-  async getTestimonials(featured?: boolean): Promise<Testimonial[]> {
-    const cacheKey = this.getCacheKey('testimonials', { featured });
-    const cached = cache.get<Testimonial[]>(cacheKey);
-    
-    if (cached) {
-      return cached;
-    }
+  async getBlogPostBySlug(slug: string) {
+    const cacheKey = this.getCacheKey('blog', 'slug', slug);
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
 
     try {
-      let dbQuery = db.select().from(testimonials).where(eq(testimonials.approved, true));
+      const post = await this.db
+        .select()
+        .from(blogPosts)
+        .where(and(
+          eq(blogPosts.slug, slug),
+          eq(blogPosts.published, true)
+        ))
+        .limit(1);
 
-      if (featured !== undefined) {
-        dbQuery = dbQuery.where(and(eq(testimonials.approved, true), eq(testimonials.featured, featured)));
-      }
-
-      dbQuery = dbQuery.orderBy(desc(testimonials.featured), desc(testimonials.createdAt));
-
-      const result = await dbQuery;
-      cache.set(cacheKey, result);
-      
+      const result = post[0] || null;
+      await this.setCache(cacheKey, result);
       return result;
     } catch (error) {
-      logError('Failed to fetch testimonials', error as Error, { featured });
+      logger.error('Error fetching blog post by slug', error);
       throw error;
     }
   }
 
-  // HEALTH CHECK
-  async healthCheck(): Promise<{ status: string; timestamp: Date }> {
+  // Testimonials methods
+  async getTestimonials(filters: any = {}) {
+    const cacheKey = this.getCacheKey('testimonials', JSON.stringify(filters));
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
+
     try {
-      await db.select().from(projects).limit(1);
-      return { status: 'healthy', timestamp: new Date() };
+      let query = this.db.select().from(testimonials);
+
+      if (filters.featured) {
+        query = query.where(eq(testimonials.featured, filters.featured));
+      }
+
+      const result = await query.orderBy(desc(testimonials.createdAt));
+      await this.setCache(cacheKey, result);
+      return result;
     } catch (error) {
-      logError('Database health check failed', error as Error);
+      logger.error('Error fetching testimonials', error);
       throw error;
     }
   }
 
-  // CLEANUP
-  async close(): Promise<void> {
-    await client.end();
-    cache.flushAll();
-    logInfo('Database connection closed');
+  // Analytics methods
+  async updateAnalytics(event: string, metadata?: any) {
+    try {
+      await this.db.insert(analytics).values({
+        id: crypto.randomUUID(),
+        event,
+        metadata: metadata ? JSON.stringify(metadata) : null,
+        createdAt: new Date()
+      });
+    } catch (error) {
+      logger.error('Error updating analytics', error);
+    }
+  }
+
+  async getAnalyticsDashboard(dateRange: string = '30d') {
+    const cacheKey = this.getCacheKey('analytics', 'dashboard', dateRange);
+    const cached = await this.getFromCache(cacheKey);
+    if (cached) return cached;
+
+    try {
+      const days = parseInt(dateRange.replace('d', ''));
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+      const [leadStats, userStats, projectViews, topProjects] = await Promise.all([
+        this.getLeadStats(cutoff),
+        this.getUserStats(cutoff),
+        this.getProjectViewStats(cutoff),
+        this.getTopProjects(cutoff)
+      ]);
+
+      const result = {
+        leadStats,
+        userStats,
+        projectViews,
+        topProjects,
+        generatedAt: new Date()
+      };
+
+      await this.setCache(cacheKey, result, 600); // Cache for 10 minutes
+      return result;
+    } catch (error) {
+      logger.error('Error generating analytics dashboard', error);
+      throw error;
+    }
+  }
+
+  private async getLeadStats(since: Date) {
+    const result = await this.db
+      .select({
+        total: sql<number>`count(*)`,
+        newLeads: sql<number>`count(*) filter (where status = 'new')`,
+        contactedLeads: sql<number>`count(*) filter (where status = 'contacted')`,
+        convertedLeads: sql<number>`count(*) filter (where status = 'converted')`
+      })
+      .from(leads)
+      .where(gte(leads.createdAt, since));
+
+    return result[0];
+  }
+
+  private async getUserStats(since: Date) {
+    const result = await this.db
+      .select({
+        total: sql<number>`count(*)`,
+        newUsers: sql<number>`count(*) filter (where created_at >= ${since})`
+      })
+      .from(users);
+
+    return result[0];
+  }
+
+  private async getProjectViewStats(since: Date) {
+    const result = await this.db
+      .select({
+        total: sql<number>`count(*)`,
+        recentViews: sql<number>`count(*) filter (where viewed_at >= ${since})`
+      })
+      .from(projectViews);
+
+    return result[0];
+  }
+
+  private async getTopProjects(since: Date) {
+    return await this.db
+      .select({
+        projectId: projectViews.projectId,
+        projectName: projects.name,
+        viewCount: sql<number>`count(*)`
+      })
+      .from(projectViews)
+      .innerJoin(projects, eq(projects.id, projectViews.projectId))
+      .where(gte(projectViews.viewedAt, since))
+      .groupBy(projectViews.projectId, projects.name)
+      .orderBy(desc(sql`count(*)`))
+      .limit(10);
+  }
+
+  private async hashPassword(password: string): Promise<string> {
+    const bcrypt = await import('bcrypt');
+    return bcrypt.hash(password, 12);
   }
 }
