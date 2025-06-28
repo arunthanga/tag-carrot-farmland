@@ -1,166 +1,377 @@
-import type { Express } from "express";
-import { createServer, type Server } from "http";
-import { storage } from "./storage";
-import { insertLeadSchema } from "@shared/schema";
-import { z } from "zod";
+import express from 'express';
+import rateLimit from 'express-rate-limit';
+import { DatabaseStorage } from './database-storage';
+import { 
+  authenticate, 
+  requireAdmin, 
+  optionalAuthenticate,
+  generateToken,
+  rateLimitByUser
+} from './middleware/auth';
+import { 
+  errorHandler, 
+  notFoundHandler, 
+  asyncHandler, 
+  validateRequest,
+  NotFoundError,
+  ValidationError,
+  AuthenticationError
+} from './middleware/errorHandler';
+import {
+  createProjectSchema,
+  updateProjectSchema,
+  projectQuerySchema,
+  createLeadSchema,
+  updateLeadSchema,
+  leadQuerySchema,
+  createUserSchema,
+  loginSchema,
+  updateUserSchema,
+  blogQuerySchema,
+  idSchema
+} from '../shared/validation';
+import { rateLimitConfig } from './config/env';
+import { logInfo, logWarn } from './config/logger';
 
-export async function registerRoutes(app: Express): Promise<Server> {
-  // Projects endpoints
-  app.get("/api/projects", async (req, res) => {
-    try {
-      const projects = await storage.getProjects();
-      res.json(projects);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch projects" });
-    }
-  });
+const router = express.Router();
+export const storage = new DatabaseStorage();
 
-  app.get("/api/projects/featured", async (req, res) => {
-    try {
-      const projects = await storage.getFeaturedProjects();
-      res.json(projects);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch featured projects" });
-    }
-  });
+// Rate limiting
+const generalLimiter = rateLimit({
+  ...rateLimitConfig,
+  message: { error: 'Too many requests, please try again later.' }
+});
 
-  app.get("/api/projects/:slug", async (req, res) => {
-    try {
-      const { slug } = req.params;
-      const project = await storage.getProjectBySlug(slug);
-      
-      if (!project) {
-        return res.status(404).json({ message: "Project not found" });
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 requests per window
+  message: { error: 'Too many requests for this action, please try again later.' }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 login attempts per window
+  message: { error: 'Too many login attempts, please try again later.' }
+});
+
+// Apply general rate limiting to all routes
+router.use(generalLimiter);
+
+// HEALTH CHECK
+router.get('/health', asyncHandler(async (req, res) => {
+  const health = await storage.healthCheck();
+  res.json(health);
+}));
+
+// PUBLIC ROUTES
+
+// Get all projects (public)
+router.get('/projects', 
+  validateRequest({ query: projectQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const projects = await storage.getProjects(req.query);
+    res.json({
+      data: projects,
+      meta: {
+        count: projects.length,
+        query: req.query
       }
-      
-      res.json(project);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch project" });
-    }
-  });
+    });
+  })
+);
 
-  // Leads endpoints
-  app.post("/api/leads", async (req, res) => {
-    try {
-      const validatedData = insertLeadSchema.parse(req.body);
-      const lead = await storage.createLead(validatedData);
-      res.status(201).json(lead);
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ 
-          message: "Invalid lead data", 
-          errors: error.errors 
-        });
+// Get featured projects (public)
+router.get('/projects/featured', 
+  asyncHandler(async (req, res) => {
+    const projects = await storage.getProjects({ featured: true, limit: 6 });
+    res.json({
+      data: projects,
+      meta: {
+        count: projects.length
       }
-      res.status(500).json({ message: "Failed to create lead" });
-    }
-  });
+    });
+  })
+);
 
-  // Blog posts endpoints
-  app.get("/api/blog", async (req, res) => {
-    try {
-      const posts = await storage.getPublishedBlogPosts();
-      res.json(posts);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch blog posts" });
+// Get project by slug (public)
+router.get('/projects/:slug', 
+  asyncHandler(async (req, res) => {
+    const { slug } = req.params;
+    const project = await storage.getProjectBySlug(slug);
+    
+    if (!project) {
+      throw new NotFoundError('Project not found');
     }
-  });
+    
+    res.json({ data: project });
+  })
+);
 
-  app.get("/api/blog/:slug", async (req, res) => {
-    try {
-      const { slug } = req.params;
-      const post = await storage.getBlogPostBySlug(slug);
-      
-      if (!post || !post.isPublished) {
-        return res.status(404).json({ message: "Blog post not found" });
+// Create lead (public, with strict rate limiting)
+router.post('/leads',
+  strictLimiter,
+  validateRequest({ body: createLeadSchema }),
+  asyncHandler(async (req, res) => {
+    const lead = await storage.createLead(req.body);
+    
+    logInfo('New lead created', { 
+      leadId: lead.id, 
+      email: lead.email,
+      source: lead.source,
+      ip: req.ip 
+    });
+    
+    res.status(201).json({
+      data: lead,
+      message: 'Thank you for your interest! We will contact you soon.'
+    });
+  })
+);
+
+// Get blog posts (public)
+router.get('/blog',
+  validateRequest({ query: blogQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const posts = await storage.getBlogPosts({ ...req.query, published: true });
+    res.json({
+      data: posts,
+      meta: {
+        count: posts.length
       }
-      
-      res.json(post);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch blog post" });
-    }
-  });
+    });
+  })
+);
 
-  // Testimonials endpoints
-  app.get("/api/testimonials", async (req, res) => {
-    try {
-      const testimonials = await storage.getActiveTestimonials();
-      res.json(testimonials);
-    } catch (error) {
-      res.status(500).json({ message: "Failed to fetch testimonials" });
-    }
-  });
-
-  // Call tracking endpoint
-  app.post("/api/call-tracking", async (req, res) => {
-    try {
-      const { phoneNumber, leadId, source } = req.body;
-      
-      // TODO: Implement call tracking and sentiment analysis
-      // This would integrate with a telephony service like Twilio
-      // and sentiment analysis service
-      
-      res.json({ 
-        message: "Call initiated", 
-        callId: `call_${Date.now()}`,
-        phoneNumber: "+919876543210"
-      });
-    } catch (error) {
-      res.status(500).json({ message: "Failed to initiate call" });
-    }
-  });
-
-  // Chatbot endpoint
-  app.post("/api/chatbot", async (req, res) => {
-    try {
-      const { message, language } = req.body;
-      
-      // Simple chatbot responses based on keywords
-      const responses = {
-        en: {
-          default: "Thank you for your interest in Tag Carrot farmland. How can I help you today?",
-          pricing: "Our farmland prices start from ₹199 per sq ft for Ghat Coco Idyll. Would you like details about specific projects?",
-          location: "We have premium farmland projects in Kerala and Tamil Nadu, including Wayanad, Munnar, and Alleppey.",
-          cottage: "Yes, cottage construction is permitted on all our farmland projects with proper approvals.",
-          returns: "Our managed farmland offers 12-22% annual returns depending on the project and crop type.",
-        },
-        ml: {
-          default: "ടാഗ് കാരറ്റ് ഫാം ലാൻഡിൽ താങ്കളുടെ താൽപ്പര്യത്തിന് നന്ദി. ഞാൻ എങ്ങനെ സഹായിക്കാം?",
-          pricing: "ഞങ്ങളുടെ ഫാം ലാൻഡ് വില ഘാറ്റ് കോക്കോ ഇഡിൽ പ്രോജക്ടിന് ഒരു ചതുരശ്ര അടിക്ക് ₹199 മുതൽ ആരംഭിക്കുന്നു.",
-          location: "ഞങ്ങൾക്ക് കേരളത്തിലും തമിഴ്‌നാട്ടിലും പ്രീമിയം ഫാം ലാൻഡ് പദ്ധതികളുണ്ട്.",
-          cottage: "ഞങ്ങളുടെ എല്ലാ ഫാം ലാൻഡ് പ്രോജക്ടുകളിലും കോട്ടേജ് നിർമ്മാണം അനുവദിച്ചിരിക്കുന്നു.",
-          returns: "ഞങ്ങളുടെ മാനേജ്ഡ് ഫാം ലാൻഡ് 12-22% വാർഷിക വരുമാനം നൽകുന്നു.",
-        },
-        ta: {
-          default: "டேக் கேரட் பண்ணை நிலத்தில் உங்கள் ஆர்வத்திற்கு நன்றி. நான் எப்படி உதவ முடியும்?",
-          pricing: "எங்கள் பண்ணை நிலத்தின் விலை காட் கோகோ இடில் திட்டத்திற்கு ஒரு சதுர அடிக்கு ₹199 முதல் தொடங்குகிறது.",
-          location: "எங்களிடம் கேரளா மற்றும் தமிழ்நாட்டில் பிரீமியம் பண்ணை நில திட்டங்கள் உள்ளன.",
-          cottage: "எங்கள் அனைத்து பண்ணை நில திட்டங்களிலும் குடிசை கட்டுமானம் அனுமதிக்கப்பட்டுள்ளது.",
-          returns: "எங்கள் நிர்வகிக்கப்பட்ட பண்ணை நிலம் 12-22% வருடாந்திர வருமானத்தை வழங்குகிறது.",
-        }
-      };
-
-      const langResponses = responses[language as keyof typeof responses] || responses.en;
-      
-      let response = langResponses.default;
-      const lowerMessage = message.toLowerCase();
-      
-      if (lowerMessage.includes('price') || lowerMessage.includes('cost')) {
-        response = langResponses.pricing || langResponses.default;
-      } else if (lowerMessage.includes('location') || lowerMessage.includes('where')) {
-        response = (langResponses as any).location || langResponses.default;
-      } else if (lowerMessage.includes('cottage') || lowerMessage.includes('house')) {
-        response = (langResponses as any).cottage || langResponses.default;
-      } else if (lowerMessage.includes('return') || lowerMessage.includes('profit')) {
-        response = (langResponses as any).returns || langResponses.default;
+// Get testimonials (public)
+router.get('/testimonials',
+  asyncHandler(async (req, res) => {
+    const featured = req.query.featured === 'true';
+    const testimonials = await storage.getTestimonials(featured);
+    res.json({
+      data: testimonials,
+      meta: {
+        count: testimonials.length
       }
+    });
+  })
+);
 
-      res.json({ response, suggestions: ["View Projects", "Schedule Visit", "Call Now"] });
-    } catch (error) {
-      res.status(500).json({ message: "Failed to process chatbot request" });
+// AUTHENTICATION ROUTES
+
+// User registration
+router.post('/auth/register',
+  strictLimiter,
+  validateRequest({ body: createUserSchema }),
+  asyncHandler(async (req, res) => {
+    const user = await storage.createUser(req.body);
+    const token = generateToken({
+      id: user.id,
+      email: user.email,
+      role: user.role
+    });
+    
+    logInfo('User registered', { userId: user.id, email: user.email });
+    
+    res.status(201).json({
+      data: { user, token },
+      message: 'Account created successfully'
+    });
+  })
+);
+
+// User login
+router.post('/auth/login',
+  authLimiter,
+  validateRequest({ body: loginSchema }),
+  asyncHandler(async (req, res) => {
+    const { email, password } = req.body;
+    const user = await storage.authenticateUser(email, password);
+    
+    if (!user) {
+      logWarn('Failed login attempt', { email, ip: req.ip });
+      throw new AuthenticationError('Invalid email or password');
     }
-  });
+    
+    const token = generateToken({
+      id: user.id,
+      email: user.email,
+      role: user.role
+    });
+    
+    logInfo('User logged in', { userId: user.id, email: user.email });
+    
+    res.json({
+      data: { user, token },
+      message: 'Login successful'
+    });
+  })
+);
 
-  const httpServer = createServer(app);
-  return httpServer;
-}
+// Get current user profile
+router.get('/auth/me',
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const user = await storage.getUserByEmail(req.user!.email);
+    if (!user) {
+      throw new NotFoundError('User not found');
+    }
+    
+    const { password, ...userWithoutPassword } = user;
+    res.json({ data: userWithoutPassword });
+  })
+);
+
+// Update user profile
+router.put('/auth/me',
+  authenticate,
+  rateLimitByUser(10, 15 * 60 * 1000), // 10 requests per 15 minutes per user
+  validateRequest({ body: updateUserSchema }),
+  asyncHandler(async (req, res) => {
+    // Implementation would go here - updating user profile
+    res.json({ message: 'Profile update endpoint - to be implemented' });
+  })
+);
+
+// PROTECTED ROUTES (Admin only)
+
+// Get all leads (admin only)
+router.get('/admin/leads',
+  authenticate,
+  requireAdmin,
+  validateRequest({ query: leadQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const leads = await storage.getLeads(req.query);
+    res.json({
+      data: leads,
+      meta: {
+        count: leads.length,
+        query: req.query
+      }
+    });
+  })
+);
+
+// Update lead status (admin only)
+router.put('/admin/leads/:id',
+  authenticate,
+  requireAdmin,
+  validateRequest({ 
+    params: idSchema.transform(id => ({ id })),
+    body: updateLeadSchema 
+  }),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const lead = await storage.updateLead(id, req.body);
+    
+    logInfo('Lead updated by admin', { 
+      leadId: id, 
+      adminId: req.user!.id,
+      updates: req.body 
+    });
+    
+    res.json({
+      data: lead,
+      message: 'Lead updated successfully'
+    });
+  })
+);
+
+// Create project (admin only)
+router.post('/admin/projects',
+  authenticate,
+  requireAdmin,
+  validateRequest({ body: createProjectSchema }),
+  asyncHandler(async (req, res) => {
+    const project = await storage.createProject(req.body);
+    
+    logInfo('Project created by admin', { 
+      projectId: project.id, 
+      adminId: req.user!.id 
+    });
+    
+    res.status(201).json({
+      data: project,
+      message: 'Project created successfully'
+    });
+  })
+);
+
+// Update project (admin only)
+router.put('/admin/projects/:id',
+  authenticate,
+  requireAdmin,
+  validateRequest({ 
+    params: idSchema.transform(id => ({ id })),
+    body: updateProjectSchema 
+  }),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const project = await storage.updateProject(id, req.body);
+    
+    logInfo('Project updated by admin', { 
+      projectId: id, 
+      adminId: req.user!.id,
+      updates: req.body 
+    });
+    
+    res.json({
+      data: project,
+      message: 'Project updated successfully'
+    });
+  })
+);
+
+// Delete project (admin only)
+router.delete('/admin/projects/:id',
+  authenticate,
+  requireAdmin,
+  validateRequest({ params: idSchema.transform(id => ({ id })) }),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    await storage.deleteProject(id);
+    
+    logInfo('Project deleted by admin', { 
+      projectId: id, 
+      adminId: req.user!.id 
+    });
+    
+    res.json({ message: 'Project deleted successfully' });
+  })
+);
+
+// Get all blog posts (admin only)
+router.get('/admin/blog',
+  authenticate,
+  requireAdmin,
+  validateRequest({ query: blogQuerySchema }),
+  asyncHandler(async (req, res) => {
+    const posts = await storage.getBlogPosts(req.query);
+    res.json({
+      data: posts,
+      meta: {
+        count: posts.length
+      }
+    });
+  })
+);
+
+// Analytics endpoint (admin only)
+router.get('/admin/analytics',
+  authenticate,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    // Get basic analytics
+    const [allLeads, newLeads, allProjects] = await Promise.all([
+      storage.getLeads(),
+      storage.getLeads({ status: 'new' }),
+      storage.getProjects()
+    ]);
+
+    const analytics = {
+      leads: {
+        total: allLeads.length,
+        new: newLeads.length,
+        byStatus: allLeads.reduce((acc, lead) => {
+          acc[lead.status] = (acc[lead.status] || 0) + 1;
+          return acc;
+        }, {} as Record
