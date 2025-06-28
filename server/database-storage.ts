@@ -1,9 +1,10 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { eq, and, gte, lte, desc, asc, sql, ilike, or } from 'drizzle-orm';
+import { eq, and, gte, lte, desc, sql, ilike } from 'drizzle-orm';
 import { projects, leads, users, blogPosts, testimonials, projectViews, analytics } from '../shared/schema';
 import { Redis } from 'ioredis';
 import { logger } from './utils/logger';
+import { Pool, PoolClient } from 'pg';
 
 interface DatabaseConfig {
   connectionString: string;
@@ -22,13 +23,27 @@ interface CacheConfig {
 }
 
 export class DatabaseStorage {
+  private readonly redis: Redis;
+  private readonly pool: Pool;
   private db: ReturnType<typeof drizzle>;
-  private cache?: Redis;
   private readonly cacheTTL: number;
 
   constructor(config?: { database?: DatabaseConfig; cache?: CacheConfig }) {
+    // Initialize connection pool
+    this.pool = new Pool({
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
+    });
+
+    // Initialize Redis for caching
+    this.redis = new Redis({
+      host: process.env.REDIS_HOST,
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      retryStrategy: (times) => Math.min(times * 50, 2000),
+    });
+
     const connectionString = config?.database?.connectionString || process.env.DATABASE_URL!;
-    
     const client = postgres(connectionString, {
       max: config?.database?.maxConnections || 20,
       idle_timeout: config?.database?.idleTimeout || 20,
@@ -36,17 +51,36 @@ export class DatabaseStorage {
     });
 
     this.db = drizzle(client);
-    this.cacheTTL = config?.cache?.ttl || 300; // 5 minutes default
+    this.cacheTTL = config?.cache?.ttl || 300;
 
-    // Initialize Redis cache if configured
-    if (config?.cache?.redis) {
-      this.cache = new Redis(config.cache.redis);
-      this.cache.on('error', (err) => {
-        logger.error('Redis connection error', err);
-      });
-    }
-
+    this.setupHealthCheck();
     this.initializeDatabase();
+  }
+  
+  private setupHealthCheck() {
+    setInterval(async () => {
+      try {
+        await this.pool.query('SELECT 1');
+        await this.redis.ping();
+      } catch (error) {
+        logger.error('Health check failed:', error);
+      }
+    }, 30000);
+  }
+
+  async withTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private async initializeDatabase() {
